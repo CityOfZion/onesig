@@ -49,6 +49,18 @@ npm i @cityofzion/onesig viem
 
 `viem` is a peer dependency. `react` is an optional peer (only for `/react`).
 
+## Try it
+
+A runnable, no-browser example lives in
+[`examples/node-basic.ts`](./examples/node-basic.ts). It plays the owner with a
+throwaway viem account (a deterministic RFC-6979 signer — like a real EOA) and
+prints the message that gets signed, the derived wallet, and proof it re-derives
+identically:
+
+```bash
+npm install && npm run example
+```
+
 ## Usage
 
 ### Core (any framework)
