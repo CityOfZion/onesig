@@ -43,11 +43,18 @@ want EIP-7702 / ERC-4337 session keys instead — see [When to use this](#when-t
 
 ## Install
 
+Straight from GitHub (builds on install via the `prepare` script):
+
 ```bash
-npm i @cityofzion/onesig viem
+npm i github:CityOfZion/onesig viem
+# pin to a release:
+npm i github:CityOfZion/onesig#v0.1.0 viem
 ```
 
 `viem` is a peer dependency. `react` is an optional peer (only for `/react`).
+
+> **npm:** publishing as `@cityofzion/onesig` is coming — then it'll be
+> `npm i @cityofzion/onesig viem`.
 
 ## Try it
 
