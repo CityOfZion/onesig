@@ -42,6 +42,11 @@ The message is human-readable so the wallet's signing popup serves as the consen
 screen, and app-namespaced so a signature obtained for one app cannot derive another
 app's wallet.
 
+Implementations MUST validate the fields before building the message — `owner` a
+20-byte address, `index` a non-negative integer, and `app`/`version`/`consent` free of
+control characters and the ` · ` separator (see §6). Otherwise a crafted field can
+collide two parameter sets onto one wallet, or re-flow the prompt the user reads.
+
 ## 4. Derivation
 
 ```
@@ -67,6 +72,12 @@ owned accounts implementing **RFC-6979** deterministic ECDSA satisfy this.
 - An implementation SHOULD detect non-determinism — e.g. by re-deriving and comparing
   the address to a prior value — and MUST fail loudly rather than silently return a
   different wallet.
+- A **first** derivation has no prior value to compare against. An implementation SHOULD
+  verify determinism before trusting such a derivation (sign a second time and confirm
+  the address matches) rather than caching an unverified result — otherwise a
+  non-deterministic wallet is silently minted and its funds stranded on the next device.
+  The reference `useSessionWallet` hook does this by default (opt out with
+  `verifyOnFirstDerive: false`).
 
 ## 6. Security model (normative)
 
@@ -78,6 +89,11 @@ owned accounts implementing **RFC-6979** deterministic ECDSA satisfy this.
 - **One message, one app.** An app MUST NOT reuse another app's exact message, and the
   owner MUST NOT be prompted with this message outside the app. (App + version namespacing
   is the defense; it is not a defense against a user signing a convincing clone.)
+- **Trusted parameters.** `app`, `version`, `index`, `owner`, and `consent` are part of
+  the signed message and MUST be trusted constants, never attacker-controlled. A non-address
+  `owner`, or an `app`/`consent` carrying the ` · ` separator or line breaks, could collide
+  two parameter sets onto one wallet or re-flow the human-readable prompt. Implementations
+  MUST validate them (§3).
 - **No on-chain revocation or rotation.** Compromise is mitigated only by small balances
   and spend caps. "Rotation" means bumping `version`, which derives a NEW wallet; funds
   must be swept across manually. Applications that need revocable, scoped authority over
@@ -90,11 +106,25 @@ Implementations MAY cache `{address, privateKey, owner, app, version, index}` ke
 re-deriving (re-signing). A cache hit whose re-derivation yields a different address
 indicates a non-deterministic wallet (§5) and MUST be surfaced as an error.
 
+The live address MUST be recomputed from the cached private key, never trusted from a
+stored `address` field; an entry whose stored address disagrees with its key is
+tampered/corrupt and MUST be evicted. The cache is a plaintext secret that any same-origin
+script can read or overwrite (§6) — it is a convenience for a pocket-change wallet, not a
+secure key store.
+
 ## 8. Interop
 
 Two implementations that agree on §3 (message) and §4 (derivation) produce identical
 wallets for the same parameters. This is intended for **re-derivation within one app
 across devices/sessions**, not as a shared cross-app identity — see §6.
+
+Re-derivation is guaranteed only when the owner account signs byte-identically. RFC-6979
+fixes `(r, s)` for one signer, but ECDSA encoding can differ across wallet *clients* — a
+non-canonical `s` (malleability) or a different `v` encoding (0/1 vs 27/28) changes the
+signature bytes and therefore the derived wallet. Re-derivation is thus reliable for the
+**same account in the same wallet client**; moving the account to a different client is
+not guaranteed to reproduce the session wallet unless signatures are canonicalized
+(low-`s`, normalized `v`) before hashing — which this version (v1) does not do.
 
 ## Prior art
 

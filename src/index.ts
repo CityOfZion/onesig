@@ -82,13 +82,49 @@ export class NonDeterministicWalletError extends Error {
   }
 }
 
+// The " · " that separates fields in the signed header. Interpolated fields must
+// not contain it (or control characters), or one (app, owner, index) tuple could
+// be made to collide with another's message — or re-flow the human-readable
+// prompt the user reads and signs.
+const FIELD_SEP = " · ";
+const CONTROL_CHARS = /[\u0000-\u001F]/; // C0 controls incl. CR/LF
+const CONTROL_CHARS_KEEP_NL = /[\u0000-\u0009\u000B-\u001F]/; // allow \n only
+
+function assertHeaderField(name: string, v: string): void {
+  if (CONTROL_CHARS.test(v)) {
+    throw new Error(`onesig: ${name} must not contain line breaks or control characters`);
+  }
+  if (v.includes(FIELD_SEP)) {
+    throw new Error(`onesig: ${name} must not contain the "${FIELD_SEP.trim()}" field separator`);
+  }
+}
+
 /** Build the canonical, human-readable message the owner signs. Deterministic:
- *  the same params always produce the same string (see SPEC.md). */
+ *  the same params always produce the same string (see SPEC.md).
+ *
+ *  Validates its inputs so they can't collide across (app, owner, index) or
+ *  re-flow the consent the user sees: `owner` must be a 20-byte address, `index`
+ *  a non-negative integer, and `app`/`version`/`consent` free of control
+ *  characters (and the field separator). These fields are SECURITY-RELEVANT —
+ *  keep them trusted constants, never attacker-controlled (see SPEC §6). */
 export function buildMessage(p: DeriveParams): string {
-  const version = String(p.version ?? "1");
-  const owner = p.owner.toLowerCase();
+  if (!/^0x[0-9a-fA-F]{40}$/.test(p.owner)) {
+    throw new Error("onesig: owner must be a 0x-prefixed 20-byte address");
+  }
   const index = p.index ?? 0;
-  const head = `${p.app} session wallet v${version} · ${owner}${index > 0 ? ` #${index}` : ""}`;
+  if (!Number.isInteger(index) || index < 0) {
+    throw new Error("onesig: index must be a non-negative integer");
+  }
+  if (p.app.length === 0) throw new Error("onesig: app must not be empty");
+  const version = String(p.version ?? "1");
+  assertHeaderField("app", p.app);
+  assertHeaderField("version", version);
+  if (p.consent !== undefined && CONTROL_CHARS_KEEP_NL.test(p.consent)) {
+    throw new Error("onesig: consent must not contain control characters");
+  }
+
+  const owner = p.owner.toLowerCase();
+  const head = `${p.app} session wallet v${version}${FIELD_SEP}${owner}${index > 0 ? ` #${index}` : ""}`;
   const consent =
     p.consent ??
     `This signature creates a self-custodied session wallet for ${p.app} — ` +
@@ -100,21 +136,29 @@ export function buildMessage(p: DeriveParams): string {
  *  ideal for tests, or for a server that was handed the signature. The signature
  *  must be over `buildMessage(params)`. */
 export function deriveFromSignature(signature: Hex, params: DeriveParams): SessionWallet {
-  if (!/^0x[0-9a-fA-F]+$/.test(signature)) {
-    throw new Error("onesig: signature must be a 0x-prefixed hex string");
+  // A personal_sign / EIP-191 signature is exactly 65 bytes (r‖s‖v) = 132 hex
+  // chars. Enforcing the length rejects truncated/short inputs that would
+  // otherwise hash to a plausible-but-WRONG wallet.
+  if (!/^0x[0-9a-fA-F]{130}$/.test(signature)) {
+    throw new Error("onesig: signature must be a 0x-prefixed 65-byte (132-char) hex string");
   }
-  // keccak the signature down to a 32-byte key. In the astronomically unlikely
-  // case the hash is 0 or ≥ the curve order, re-hash (privateKeyToAccount throws).
+  // keccak the signature BYTES into a 32-byte key. In the astronomically
+  // unlikely case the hash is 0 or ≥ the curve order, privateKeyToAccount throws
+  // and we re-hash — rejection sampling onto [1, n-1]. Keep the validated account
+  // from inside the loop (no double derivation) and fail loud on the impossible
+  // exhaustion rather than returning a wallet built from an unchecked key.
   let pk = keccak256(signature);
-  for (let i = 0; i < 8; i++) {
+  let account: PrivateKeyAccount | null = null;
+  for (let i = 0; i < 8 && !account; i++) {
     try {
-      privateKeyToAccount(pk);
-      break;
+      account = privateKeyToAccount(pk);
     } catch {
       pk = keccak256(pk);
     }
   }
-  const account = privateKeyToAccount(pk);
+  if (!account) {
+    throw new Error("onesig: could not derive a valid key from the signature");
+  }
   return {
     address: account.address,
     privateKey: pk,

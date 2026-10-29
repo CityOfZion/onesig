@@ -1,15 +1,23 @@
 /**
  * onesig/react — a thin hook around the core.
  *
- * It caches the derived wallet per (owner, app, version, index) so the user
- * signs once, not every visit — and when the user re-derives (new device, or an
- * explicit "re-sign"), it compares the result to the cache and throws
- * `NonDeterministicWalletError` if the address changed. That's the free,
- * no-extra-popup way to catch an unsupported wallet.
+ * Caches the derived wallet per (owner, app, version, index) so the user signs
+ * once, not every visit. Determinism — the property the whole scheme rests on —
+ * is enforced here:
+ *   • re-derive with a cache present → the fresh derivation is compared to the
+ *     stored address (free, no extra popup);
+ *   • first derive with NO cache (new device, caching off) → unless you opt out
+ *     via `verifyOnFirstDerive: false`, it signs a SECOND time and confirms the
+ *     result matches before trusting/caching it — so a non-deterministic
+ *     (smart-contract / non-RFC-6979) wallet fails loudly with
+ *     `NonDeterministicWalletError` instead of silently minting a different,
+ *     unrecoverable wallet on each device.
  *
- * The cache holds the private key. That's acceptable ONLY because this is a
- * pocket-change hot wallet (see SPEC.md); never store value here you'd mind a
- * compromised browser draining.
+ * The cache holds the private key, and the live address is ALWAYS recomputed
+ * from that key (an entry whose stored address and key disagree is evicted).
+ * That is acceptable only because this is a pocket-change hot wallet (see
+ * SPEC.md): any same-origin script can still read or overwrite the cache, so
+ * never store value here you'd mind a compromised browser draining.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -19,19 +27,25 @@ import {
   deriveSessionWallet,
   NonDeterministicWalletError,
   type Address,
-  type Hex,
   type SessionWallet,
   type SignParams,
 } from "./index.js";
 
 type Cached = Pick<SessionWallet, "address" | "privateKey" | "owner" | "app" | "version" | "index">;
+type CacheStore = Pick<Storage, "getItem" | "setItem" | "removeItem">;
 
 export interface UseSessionWalletOptions extends SignParams {
   /** Where to cache. Defaults to `localStorage`; pass `null` to disable caching
    *  (the user then re-signs every mount). */
-  storage?: Pick<Storage, "getItem" | "setItem" | "removeItem"> | null;
+  storage?: CacheStore | null;
   /** Cache-key prefix. Default "onesig". */
   cachePrefix?: string;
+  /** On a COLD derive (no cache to compare against) sign a second time and
+   *  confirm the wallet re-derives identically before trusting it — the loud
+   *  guard against non-deterministic wallets. Costs one extra popup on first
+   *  setup (per device). Default `true`; set `false` for a pure one-signature
+   *  flow when you KNOW all your users sign deterministically (EOAs only). */
+  verifyOnFirstDerive?: boolean;
 }
 
 export type SessionWalletStatus = "idle" | "deriving" | "ready" | "error";
@@ -39,7 +53,7 @@ export type SessionWalletStatus = "idle" | "deriving" | "ready" | "error";
 export interface UseSessionWalletResult {
   /** The derived wallet, or null until `derive()` has run (or a cache hit). */
   wallet: SessionWallet | null;
-  /** Prompt the signature and derive (verifies against cache on re-derive). */
+  /** Prompt the signature(s) and derive — verifies determinism (see hook docs). */
   derive: () => Promise<SessionWallet>;
   /** Forget the cached wallet for these params (does not touch funds). */
   clear: () => void;
@@ -49,7 +63,7 @@ export interface UseSessionWalletResult {
   message: string;
 }
 
-function defaultStorage(): UseSessionWalletOptions["storage"] {
+function defaultStorage(): CacheStore | null {
   try {
     if (typeof window !== "undefined" && window.localStorage) return window.localStorage;
   } catch {
@@ -58,8 +72,38 @@ function defaultStorage(): UseSessionWalletOptions["storage"] {
   return null;
 }
 
+function readCached(storage: CacheStore, key: string): Cached | null {
+  try {
+    const raw = storage.getItem(key);
+    if (!raw) return null;
+    const c = JSON.parse(raw) as Cached;
+    return typeof c?.privateKey === "string" && c.privateKey.startsWith("0x") ? c : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Rebuild the live wallet from a cache entry, ALWAYS recomputing the address
+ *  from the stored private key (never trusting the stored `address`). */
 function reviveAccount(c: Cached): SessionWallet {
-  return { ...c, account: privateKeyToAccount(c.privateKey) };
+  const account = privateKeyToAccount(c.privateKey);
+  return { ...c, address: account.address, account };
+}
+
+function writeCache(storage: CacheStore, key: string, w: SessionWallet): void {
+  const toCache: Cached = {
+    address: w.address,
+    privateKey: w.privateKey,
+    owner: w.owner,
+    app: w.app,
+    version: w.version,
+    index: w.index,
+  };
+  try {
+    storage.setItem(key, JSON.stringify(toCache));
+  } catch {
+    /* storage full/blocked — still return the wallet */
+  }
 }
 
 export function useSessionWallet(opts: UseSessionWalletOptions): UseSessionWalletResult {
@@ -69,6 +113,7 @@ export function useSessionWallet(opts: UseSessionWalletOptions): UseSessionWalle
     version = "1",
     index = 0,
     cachePrefix = "onesig",
+    verifyOnFirstDerive = true,
   } = opts;
   const storage = opts.storage === undefined ? defaultStorage() : opts.storage;
 
@@ -96,18 +141,21 @@ export function useSessionWallet(opts: UseSessionWalletOptions): UseSessionWalle
       setStatus("idle");
       return;
     }
-    try {
-      const raw = storage.getItem(key);
-      if (raw) {
-        const c = JSON.parse(raw) as Cached;
-        if (c?.privateKey?.startsWith("0x")) {
-          setWallet(reviveAccount(c));
-          setStatus("ready");
-          return;
-        }
+    const c = readCached(storage, key);
+    if (c) {
+      const revived = reviveAccount(c);
+      // tamper/corruption guard: if the stored address disagrees with the one
+      // the key actually produces, the entry is untrustworthy — evict and reset.
+      if (!c.address || c.address.toLowerCase() === revived.address.toLowerCase()) {
+        setWallet(revived);
+        setStatus("ready");
+        return;
       }
-    } catch {
-      /* corrupt/blocked cache — fall through to idle, derive() recovers */
+      try {
+        storage.removeItem(key);
+      } catch {
+        /* ignore */
+      }
     }
     setWallet(null);
     setStatus("idle");
@@ -117,36 +165,26 @@ export function useSessionWallet(opts: UseSessionWalletOptions): UseSessionWalle
     setStatus("deriving");
     setError(null);
     try {
-      const w = await deriveSessionWallet(optsRef.current);
-      // verify-on-re-derive: a different address than the cache means the wallet
-      // didn't sign deterministically → unsupported.
-      if (storage) {
-        try {
-          const raw = storage.getItem(key);
-          if (raw) {
-            const prev = JSON.parse(raw) as Cached;
-            if (prev?.address && prev.address.toLowerCase() !== w.address.toLowerCase()) {
-              throw new NonDeterministicWalletError(owner as Address);
-            }
-          }
-        } catch (e) {
-          if (e instanceof NonDeterministicWalletError) throw e;
-          /* unreadable cache — ignore, just write the fresh one */
+      const cur = optsRef.current;
+      const w = await deriveSessionWallet(cur);
+
+      // Determinism enforcement.
+      const prior = storage ? readCached(storage, key) : null;
+      if (prior?.address) {
+        // warm cache → compare to the stored address (free, no extra popup)
+        if (prior.address.toLowerCase() !== w.address.toLowerCase()) {
+          throw new NonDeterministicWalletError(owner as Address);
         }
-        const toCache: Cached = {
-          address: w.address,
-          privateKey: w.privateKey,
-          owner: w.owner,
-          app: w.app,
-          version: w.version,
-          index: w.index,
-        };
-        try {
-          storage.setItem(key, JSON.stringify(toCache));
-        } catch {
-          /* storage full/blocked — still return the wallet */
+      } else if (verifyOnFirstDerive) {
+        // cold → nothing to compare against, so sign once more and confirm
+        // before trusting (and caching) a single derivation.
+        const again = await deriveSessionWallet(cur);
+        if (again.address.toLowerCase() !== w.address.toLowerCase()) {
+          throw new NonDeterministicWalletError(owner as Address);
         }
       }
+
+      if (storage) writeCache(storage, key, w);
       setWallet(w);
       setStatus("ready");
       return w;
@@ -155,7 +193,7 @@ export function useSessionWallet(opts: UseSessionWalletOptions): UseSessionWalle
       setStatus("error");
       throw e;
     }
-  }, [key, storage, owner]);
+  }, [key, storage, owner, verifyOnFirstDerive]);
 
   const clear = useCallback(() => {
     try {

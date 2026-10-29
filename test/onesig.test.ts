@@ -7,6 +7,7 @@ import {
   deriveFromSignature,
   deriveSessionWallet,
   NonDeterministicWalletError,
+  type Address,
   type Hex,
 } from "../src/index.js";
 
@@ -76,4 +77,29 @@ test("assertDeterministic: throws for a non-deterministic (smart-wallet-like) si
     () => assertDeterministic({ app: "A", owner: owner.address, signMessage: flaky }),
     (e: unknown) => e instanceof NonDeterministicWalletError,
   );
+});
+
+test("deriveFromSignature: rejects wrong-length signatures; accepts a canonical 65-byte one", async () => {
+  // non-hex, too short, and a real-looking 64-byte truncation all rejected
+  assert.throws(() => deriveFromSignature("0xZZ" as Hex, { app: "A", owner: owner.address }));
+  assert.throws(() => deriveFromSignature("0xabcd" as Hex, { app: "A", owner: owner.address }));
+  assert.throws(() => deriveFromSignature(("0x" + "ab".repeat(64)) as Hex, { app: "A", owner: owner.address }));
+  const params = { app: "A", owner: owner.address };
+  const sig = await owner.signMessage({ message: buildMessage(params) });
+  assert.equal(sig.length, 132); // 0x + 130 hex = 65 bytes
+  assert.ok(deriveFromSignature(sig, params).address.startsWith("0x"));
+});
+
+test("buildMessage: validates owner/index and rejects control chars + the field separator", () => {
+  assert.throws(() => buildMessage({ app: "A", owner: "0x1234" as Address })); // not a 20-byte address
+  assert.throws(() => buildMessage({ app: "", owner: owner.address })); // empty app
+  assert.throws(() => buildMessage({ app: "A", owner: owner.address, index: -1 })); // bad index
+  assert.throws(() => buildMessage({ app: "A\n\nURGENT", owner: owner.address })); // consent re-flow
+  assert.throws(() => buildMessage({ app: "A · B", owner: owner.address })); // field separator
+  assert.throws(() => buildMessage({ app: "A", owner: owner.address, consent: "bad\u0000" })); // control char
+});
+
+test("buildMessage: a crafted owner can no longer collide across the index namespace", () => {
+  // `${owner} #5` used to produce the same bytes as index:5 — now rejected.
+  assert.throws(() => buildMessage({ app: "A", owner: `${owner.address} #5` as Address }));
 });

@@ -33,8 +33,11 @@ Two properties decide whether `onesig` is safe for your case. They are not fine 
 1. **Deterministic-signing EOAs only (RFC-6979).** MetaMask, Ledger, Rabby, Coinbase
    Wallet, etc. sign the same message the same way every time, so the wallet always
    comes back. **Smart-contract wallets — Safe, ERC-4337, Argent — do _not_** (their
-   ERC-1271 signatures aren't a stable blob to hash). `onesig` detects this and throws
-   `NonDeterministicWalletError` instead of silently minting a different wallet.
+   ERC-1271 signatures aren't a stable blob to hash). The `useSessionWallet` hook
+   **verifies this before trusting the first derivation** (one extra signature at setup;
+   opt out with `verifyOnFirstDerive: false`) and on every re-derive, throwing
+   `NonDeterministicWalletError` rather than silently minting a different wallet. With the
+   bare `deriveSessionWallet`, run `assertDeterministic` once yourself.
 2. **The signature _is_ the key.** Anyone who gets the owner to sign that exact message
    can derive — and drain — the wallet. So: keep **pocket change only** here, **cap what
    it can spend server-side**, and **never prompt this message anywhere but your app**.
@@ -50,13 +53,12 @@ Straight from GitHub (builds on install via the `prepare` script):
 ```bash
 npm i github:CityOfZion/onesig viem
 # pin to a release:
-npm i github:CityOfZion/onesig#v0.1.0 viem
+npm i github:CityOfZion/onesig#v0.2.0 viem
 ```
 
 `viem` is a peer dependency. `react` is an optional peer (only for `/react`).
 
-> **npm:** publishing as `@cityofzion/onesig` is coming — then it'll be
-> `npm i @cityofzion/onesig viem`.
+> Distributed via GitHub for now (not on npm) — pin a tag for stability.
 
 ## Try it
 
@@ -69,6 +71,9 @@ identically:
 ```bash
 npm install && npm run example
 ```
+
+A browser example (Next.js + MetaMask, using the React hook) is in
+[`examples/nextjs`](./examples/nextjs).
 
 ## Usage
 
@@ -112,9 +117,12 @@ function Agent({ owner }: { owner: `0x${string}` }) {
 }
 ```
 
-The hook caches per `(owner, app, version, index)` so the user signs once, and
-**verifies on re-derivation** — if signing again yields a different address, it throws
-`NonDeterministicWalletError` (the free way to catch an unsupported wallet).
+The hook caches per `(owner, app, version, index)` so the user signs once after setup. It
+**verifies determinism** — by default a *second* signature on the first derive (opt out
+with `verifyOnFirstDerive: false`), then a free comparison against the cache on every
+re-derive — throwing `NonDeterministicWalletError` for an unsupported wallet instead of
+silently minting a different one. The cached address is always recomputed from the stored
+key, and a tampered entry (address ≠ key) is evicted.
 
 ### Multiple wallets, and rotation
 
@@ -151,7 +159,7 @@ Full format and threat model: **[SPEC.md](./SPEC.md)**.
 | `buildMessage(params)` | The exact message that gets signed. |
 | `assertDeterministic(params)` | Sign twice; throw if the wallet isn't deterministic. |
 | `NonDeterministicWalletError` | Thrown for unsupported wallets. |
-| `useSessionWallet(opts)` *(`/react`)* | Cache + verify-on-re-derive hook. |
+| `useSessionWallet(opts)` *(`/react`)* | Cache + determinism-verifying hook. |
 
 ## When to use this
 
