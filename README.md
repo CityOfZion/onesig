@@ -1,5 +1,7 @@
 # onesig
 
+[![CI](https://github.com/CityOfZion/onesig/actions/workflows/ci.yml/badge.svg)](https://github.com/CityOfZion/onesig/actions/workflows/ci.yml)
+
 **One signature → a self-custodied session wallet.** The owner signs one
 human-readable message with their normal wallet; `onesig` turns that signature
 into a ready-to-use [viem](https://viem.sh) account. Same owner + same app always
